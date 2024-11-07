@@ -1,407 +1,239 @@
+# Đoginals Delegates
+
+ℹ️ This is a fork/based on [apezord/ord-dogecoin](https://github.com/apezord/ord-dogecoin)
+
+## ‼️ DISCLAIMER: THIS CODE MAY STILL HAVE BUGS️, AS ITS STILL IN DEVELOPMENT AND TESTING STAGES....‼️
+
 # Delegates
 
-Here is the full `doginals.js` script with the necessary updates to handle delegate and child inscriptions. I'll also include a README file detailing the updates and how to use the script.
-
-### `doginals.js`
-
-```javascript
-#!/usr/bin/env node
-
-const dogecore = require('bitcore-lib-doge');
-const axios = require('axios');
-const fs = require('fs');
-const dotenv = require('dotenv');
-const mime = require('mime-types');
-const express = require('express');
-const { PrivateKey, Address, Transaction, Script, Opcode } = dogecore;
-const { Hash, Signature } = dogecore.crypto;
-
-dotenv.config();
-
-if (process.env.TESTNET == 'true') {
-    dogecore.Networks.defaultNetwork = dogecore.Networks.testnet;
-}
-
-if (process.env.FEE_PER_KB) {
-    Transaction.FEE_PER_KB = parseInt(process.env.FEE_PER_KB);
-} else {
-    Transaction.FEE_PER_KB = 100000000;
-}
-
-const WALLET_PATH = process.env.WALLET || '.wallet.json';
-
-async function main() {
-    let cmd = process.argv[2];
-
-    if (fs.existsSync('pending-txs.json')) {
-        console.log('found pending-txs.json. rebroadcasting...');
-        const txs = JSON.parse(fs.readFileSync('pending-txs.json'));
-        await broadcastAll(txs.map(tx => new Transaction(tx)), false);
-        return;
-    }
-
-    if (cmd == 'mint') {
-        await mint();
-    } else if (cmd == 'wallet') {
-        await wallet();
-    } else if (cmd == 'server') {
-        await server();
-    } else if (cmd == 'drc-20') {
-        await doge20();
-    } else {
-        throw new Error(`unknown command: ${cmd}`);
-    }
-}
-
-async function mint(paramAddress, paramContentTypeOrFilename, paramHexData, delegateTxid = null, delegateIndex = null) {
-    const argAddress = paramAddress || process.argv[3];
-    const argContentTypeOrFilename = paramContentTypeOrFilename || process.argv[4];
-    const argHexData = paramHexData || process.argv[5];
-
-    let address = new Address(argAddress);
-    let contentType;
-    let data;
-
-    if (fs.existsSync(argContentTypeOrFilename)) {
-        contentType = mime.contentType(mime.lookup(argContentTypeOrFilename));
-        data = fs.readFileSync(argContentTypeOrFilename);
-    } else {
-        contentType = argContentTypeOrFilename;
-        if (!/^[a-fA-F0-9]*$/.test(argHexData)) throw new Error('data must be hex');
-        data = Buffer.from(argHexData, 'hex');
-    }
-
-    if (data.length == 0) {
-        throw new Error('no data to mint');
-    }
-
-    if (contentType.length > MAX_SCRIPT_ELEMENT_SIZE) {
-        throw new Error('content type too long');
-    }
-
-    let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
-    let txs = inscribe(wallet, address, contentType, data, delegateTxid, delegateIndex);
-
-    await broadcastAll(txs, false);
-}
-
-function inscribe(wallet, address, contentType, data, delegateTxid = null, delegateIndex = null) {
-    let txs = [];
-    let privateKey = new PrivateKey(wallet.privkey);
-    let publicKey = privateKey.toPublicKey();
-
-    let parts = [];
-    while (data.length) {
-        let part = data.slice(0, Math.min(MAX_CHUNK_LEN, data.length));
-        data = data.slice(part.length);
-        parts.push(part);
-    }
-
-    let inscription = new Script();
-    inscription.chunks.push(bufferToChunk('ord'));
-    inscription.chunks.push(numberToChunk(parts.length));
-    inscription.chunks.push(bufferToChunk(contentType));
-
-    parts.forEach((part, n) => {
-        inscription.chunks.push(numberToChunk(parts.length - n - 1));
-        inscription.chunks.push(bufferToChunk(part));
-    });
-
-    // Add delegate information if provided
-    if (delegateTxid && delegateIndex !== null) {
-        inscription.chunks.push(numberToChunk(11));
-        let delegateBytes = Buffer.concat([
-            Buffer.from(delegateTxid, 'hex').reverse(),
-            Buffer.from([delegateIndex & 0xff, (delegateIndex >> 8) & 0xff, (delegateIndex >> 16) & 0xff, (delegateIndex >> 24) & 0xff]).filter(byte => byte !== 0)
-        ]);
-        inscription.chunks.push(bufferToChunk(delegateBytes));
-    }
-
-    // ... (rest of the inscribe logic remains the same)
-    return txs;
-}
-
-async function broadcastAll(txs, retry) {
-    for (let i = 0; i < txs.length; i++) {
-        console.log(`broadcasting tx ${i + 1} of ${txs.length}`);
-
-        try {
-            await broadcast(txs[i], retry);
-        } catch (e) {
-            console.log('broadcast failed', e?.response?.data);
-            if (e?.response?.data?.error?.message?.includes("bad-txns-inputs-spent") || e?.response?.data?.error?.message?.includes("already in block chain")) {
-                console.log('tx already sent, skipping');
-                continue;
-            }
-            console.log('saving pending txs to pending-txs.json');
-            console.log('to reattempt broadcast, re-run the command');
-            fs.writeFileSync('pending-txs.json', JSON.stringify(txs.slice(i).map(tx => tx.toString())));
-            process.exit(1);
-        }
-    }
-
-    try {
-        fs.unlinkSync('pending-txs.json');
-    } catch (err) {
-        // ignore
-    }
-
-    if (txs.length > 1) {
-        console.log('inscription txid:', txs[1].hash);
-    }
-}
-
-async function broadcast(tx, retry) {
-    const body = {
-        jsonrpc: "1.0",
-        id: 0,
-        method: "sendrawtransaction",
-        params: [tx.toString()]
-    };
-
-    const options = {
-        auth: {
-            username: process.env.NODE_RPC_USER,
-            password: process.env.NODE_RPC_PASS
-        }
-    };
-
-    while (true) {
-        try {
-            await axios.post(process.env.NODE_RPC_URL, body, options);
-            break;
-        } catch (e) {
-            if (!retry) throw e;
-            let msg = e.response && e.response.data && e.response.data.error && e.response.data.error.message;
-            if (msg && msg.includes('too-long-mempool-chain')) {
-                console.warn('retrying, too-long-mempool-chain');
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            } else {
-                throw e;
-            }
-        }
-    }
-
-    let wallet = JSON.parse(fs.readFileSync(WALLET_PATH));
-
-    updateWallet(wallet, tx);
-
-    fs.writeFileSync(WALLET_PATH, JSON.stringify(wallet, 0, 2));
-}
-
-function bufferToChunk(b, type) {
-    b = Buffer.from(b, type);
-    return {
-        buf: b.length ? b : undefined,
-        len: b.length,
-        opcodenum: b.length <= 75 ? b.length : b.length <= 255 ? 76 : 77
-    };
-}
-
-function numberToChunk(n) {
-    return {
-        buf: n <= 16 ? undefined : n < 128 ? Buffer.from([n]) : Buffer.from([n % 256, n / 256]),
-        len: n <= 16 ? 0 : n < 128 ? 1 : 2,
-        opcodenum: n == 0 ? 0 : n <= 16 ? 80 + n : n < 128 ? 1 : 2
-    };
-}
-
-function opcodeToChunk(op) {
-    return { opcodenum: op };
-}
-
-const MAX_SCRIPT_ELEMENT_SIZE = 520;
-const MAX_CHUNK_LEN = 240;
-const MAX_PAYLOAD_LEN = 1500;
-
-function inscribe(wallet, address, contentType, data, delegateTxid = null, delegateIndex = null) {
-    let txs = [];
-    let privateKey = new PrivateKey(wallet.privkey);
-    let publicKey = privateKey.toPublicKey();
-
-    let parts = [];
-    while (data.length) {
-        let part = data.slice(0, Math.min(MAX_CHUNK_LEN, data.length));
-        data = data.slice(part.length);
-        parts.push(part);
-    }
-
-    let inscription = new Script();
-    inscription.chunks.push(bufferToChunk('ord'));
-    inscription.chunks.push(numberToChunk(parts.length));
-    inscription.chunks.push(bufferToChunk(contentType));
-
-    parts.forEach((part, n) => {
-        inscription.chunks.push(numberToChunk(parts.length - n - 1));
-        inscription.chunks.push(bufferToChunk(part));
-    });
-
-    // Add delegate information if provided
-    if (delegateTxid && delegateIndex !== null) {
-        inscription.chunks.push(numberToChunk(11));
-        let delegateBytes = Buffer.concat([
-            Buffer.from(delegateTxid, 'hex').reverse(),
-            Buffer.from([delegateIndex & 0xff, (delegateIndex >> 8) & 0xff, (delegateIndex >> 16) & 0xff, (delegateIndex >> 24) & 0xff]).filter(byte => byte !== 0)
-        ]);
-        inscription.chunks.push(bufferToChunk(delegateBytes));
-    }
-
-    // ... (rest of the inscribe logic remains the same)
-
-    return txs;
-}
-
-function updateWallet(wallet, tx) {
-    wallet.utxos = wallet.utxos.filter(utxo => {
-
-
-        for (const input of tx.inputs) {
-            if (input.prevTxId.toString('hex') == utxo.txid && input.outputIndex == utxo.vout) {
-                return false;
-            }
-        }
-        return true;
-    });
-
-    tx.outputs.forEach((output, vout) => {
-        if (output.script.toAddress().toString() == wallet.address) {
-            wallet.utxos.push({
-                txid: tx.hash,
-                vout,
-                script: output.script.toHex(),
-                satoshis: output.satoshis
-            });
-        }
-    });
-}
-
-function extract(txid) {
-    const body = {
-        jsonrpc: "1.0",
-        id: "extract",
-        method: "getrawtransaction",
-        params: [txid, true] // [txid, verbose=true]
-    };
-
-    const options = {
-        auth: {
-            username: process.env.NODE_RPC_USER,
-            password: process.env.NODE_RPC_PASS
-        }
-    };
-
-    let response = await axios.post(process.env.NODE_RPC_URL, body, options);
-    let transaction = response.data.result;
-
-    let inputs = transaction.vin;
-    let scriptHex = inputs[0].scriptSig.hex;
-    let script = Script.fromHex(scriptHex);
-    let chunks = script.chunks;
-
-    let prefix = chunks.shift().buf.toString('utf-8');
-    if (prefix != 'ord') {
-        throw new Error('not a doginal');
-    }
-
-    let pieces = chunkToNumber(chunks.shift());
-    let contentType = chunks.shift().buf.toString('utf-8');
-
-    let data = Buffer.alloc(0);
-    let remaining = pieces;
-
-    while (remaining && chunks.length) {
-        let n = chunkToNumber(chunks.shift());
-        if (n === 11) {
-            let delegateBytes = chunks.shift().buf;
-            let delegateTxid = delegateBytes.slice(0, 32).reverse().toString('hex');
-            let delegateIndex = delegateBytes.length > 32 ? delegateBytes.readUInt32LE(32) : 0;
-
-            return extract(delegateTxid); // Resolve and return delegate content
-        }
-        if (n !== remaining - 1) {
-            txid = transaction.vout[0].spent.hash;
-            response = await axios.post(process.env.NODE_RPC_URL, body, options);
-            transaction = response.data.result;
-            inputs = transaction.vin;
-            scriptHex = inputs[0].scriptSig.hex;
-            script = Script.fromHex(scriptHex);
-            chunks = script.chunks;
-            continue;
-        }
-
-        data = Buffer.concat([data, chunks.shift().buf]);
-        remaining -= 1;
-    }
-
-    return {
-        contentType,
-        data
-    };
-}
-
-function server() {
-    const app = express();
-    const port = process.env.SERVER_PORT ? parseInt(process.env.SERVER_PORT) : 3000;
-
-    app.get('/tx/:txid', (req, res) => {
-        extract(req.params.txid).then(result => {
-            res.setHeader('content-type', result.contentType);
-            res.send(result.data);
-        }).catch(e => res.send(e.message));
-    });
-
-    app.listen(port, () => {
-        console.log(`Listening on port ${port}`);
-        console.log();
-        console.log(`Example:`);
-        console.log(`http://localhost:${port}/tx/15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62e`);
-    });
-}
-
-main().catch(e => {
-    let reason = e.response && e.response.data && e.response.data.error && e.response.data.error.message;
-    console.error(reason ? e.message + ':' + reason : e.message);
-});
-```
-
-### README.md
-
-```markdown
-# Doginals.js
-
 ## Overview
+The Protocol for inscriptions on Dogecoin, now updated with added support for Delegation rights. Here is the full `doginals.js` script with the necessary updates, instructions, and examples to handle delegate and child inscriptions. Also included id a `DoginalsREADME.md` file detailing how to set up and use the `doginals.js` script.
 
-Doginals.js is a script to inscribe content onto the Dogecoin blockchain, including support for creating delegate inscriptions and child inscriptions that reference delegates.
 
-## Setup
+## Parameters for flexible control over the delegation's rights and constraints:
 
-1. Install dependencies:
-    ```sh
-    npm install bitcore-lib-doge axios dotenv mime-types express
-    ```
+***When setting up delegation in your Doginals system, you can define custom parameters for flexible control over the delegation's rights and constraints. Here are some useful parameters you could add to extend the functionality and specificity of your delegation setup:***
 
-2. Create a `.env` file with the following content:
-    ```ini
-    TESTNET=true # or false if you want to use the main network
-    WALLET=.wallet.json
-    NODE_RPC_URL=http://localhost:22555
-    NODE_RPC_USER=your_rpc_username
-    NODE_RPC_PASS=your_rpc_password
-    FEE_PER_KB=100000000
-    SERVER_PORT=3000
-    ```
+### 1. Permission Level (permission_level)
 
-## Usage
+- Description: Specifies the scope or intensity of the rights granted. This could be a simple label like "view", "mint", or "transfer", defining the exact actions the delegated address can perform.
 
-### Creating a Delegate Inscription
+- Example: "mint_only", "full_access"
 
-To create a delegate inscription with a JPEG file:
+- Usage:
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "mint_only" 5000`
 
-```sh
-node doginals.js mint DELEGATE_ADDRESS image/jpeg path/to/delegate.jpg
-```
 
-Replace `DELEGATE_ADDRESS` with your Dogecoin address and `path/to/delegate.jpg` with the path to your JPEG file.
+### 2. Expiration Date (expiration)
+
+- Description: Sets a time limit for the delegation’s validity. After this date, the delegate rights automatically expire, and the delegated address loses access.
+
+- Format: ISO 8601 (e.g., "2024-12-31T23:59:59Z")
+
+- Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "creator_rights" 5000 "2024-12-31T23:59:59Z"`
+
+### 3. Allowed Content Types (content_types)
+
+- Description: Limits the types of content (e.g., images, text, audio) that the delegate can mint or interact with. Useful for specific applications where delegates should only handle certain media types.
+
+- Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "image_only" 1000 "image/jpeg,image/png"`
+
+## 4. Rate Limit (rate_limit)
+
+- Description: Defines how frequently the delegate can perform actions (e.g., number of mints per day). This rate-limiting mechanism prevents excessive actions within a short timeframe.
+
+- Format: Numeric, representing actions per time period.
+
+- Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "mint_limited" 500 "10_per_day"`
+
+## 5. Geographic or IP Restrictions (geo_restrictions or ip_whitelist)
+
+- Description: Restricts the delegate's actions to specific geographic regions or IP addresses. Useful for regionalized deployments or to limit actions to a trusted network.
+
+- Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "regional_rights" 1000 "US,CA"`
+
+- Alternatively:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "secured_access" 1000 "192.168.1.0/24"`
+
+## 6. Transfer Rights (can_transfer)
+
+- Description: Indicates whether the delegate can transfer or assign its rights to another address. This can either be "true" or "false".
+
+- Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "creator_rights" 5000 "true"`
+
+## 7. Usage Restriction by Wallet Balance (min_wallet_balance)
+
+- Description: Requires the delegated wallet to hold a minimum balance to exercise its rights. This can be useful to ensure certain actions are limited to wallets with enough DOGE to support fees or transaction requirements.
+
+- Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "premium_access" 1000 "1000_DOGE"`
+
+## 8. Custom Metadata (metadata)
+Description: Allows additional metadata fields relevant to specific applications, such as tags, labels, or notes describing the delegation.
+Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "creator_rights" 5000 "Event_2024"`
+
+
+### Putting It All Together
+
+With these parameters, your command to deploy a delegation might look like this:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "mint_only" 1000 "2024-12-31T23:59:59Z" "image/jpeg,image/png" "10_per_day" "true" "1000_DOGE" "Event_2024"`
+
+
+***These parameters give you a lot of flexibility in tailoring delegation to specific use cases, ensuring that each delegated address has clear, enforceable permissions.***
+
+
+
+## Creating a Delegate Inscription
+
+To support delegates in your doginals.js script, here are the delegate-specific commands and example usages for your Doginal NFT project:
+
+### Delegate Commands & Examples
+
+**Deploying & Minting with Delegation**
+
+*Setting Up Delegate Parameters for Deployment If delegates are part of a broader setup (such as transferring rights or permissions in your Doginal ecosystem), you might need to expand delegate functionality by creating an initial delegation deployment.*
+
+**Delegate deploy Command:**
+`node . delegate deploy <address> <delegate_param1> <delegate_param2>`
+
+Example:
+
+`node . delegate deploy D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "creator_rights" 5000`
+
+This example deploys a delegate with creator_rights and assigns a limit of 5000 to this delegation setup.
+Transferring Delegated Rights Use this if you need to transfer or reassign delegated rights within the Doginal ecosystem.
+
+#### Breakdown of What This Command Does
+
+**Delegate Rights to an Address (Wallet):**
+
+Here, you’re effectively assigning or deploying a set of rights to a specific Dogecoin address (`D9UcJkdirVLY11UtF77WnC8peg6xRYsogu` in this example). This address now holds the rights to a specific delegated operation, such as minting or transferring.
+
+The creator_rights parameter is an arbitrary string that represents a type of right or permission you’re defining for this address, indicating what kind of delegated power this address has.
+
+Deployment (delegate deploy) sets up a new delegation reference, associating a wallet with specific rights.
+DelegateTxId is an identifier to be used later on for minting, transferring, etc., using those delegated rights.
+
+Limit provides a cap on the actions the delegated address can perform.
+
+
+**Inscription ID / Delegation Reference:**
+
+This example doesn't involve an inscription ID directly but instead is setting up a new delegation that could be referenced in future commands.
+The 5000 is an example of a quantity or limit associated with the rights—meaning this address might be allowed to perform this delegated action (like minting or transferring) up to 5000 times.
+
+
+**Real-World Analogy:**
+
+Think of this as setting up a "minting allowance" or "minting quota" for this specific wallet. Once deployed, the delegate allows the specified address to perform actions on behalf of the delegator (like minting NFTs or transferring tokens) up to the specified limit.
+
+## Following Actions: 
+
+Referencing the Delegation
+After deploying the delegate, this reference can be used in future transactions by passing an inscription ID (e.g., `delegateTxId`) associated with the delegation to specify the particular delegated rights you want to invoke.
+
+Use this command when minting an NFT with a delegate inscription by providing the `delegateTxId` parameter, which refers to the inscription ID of the delegated transaction. Here’s an example of referencing it
+
+**Mint Delegate from data:**
+
+Command:
+
+`node . mint <address> <content_type> <data_hex> <delegateTxId>`
+
+Example:
+
+`node . mint D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "text/plain;charset=utf-8" 48656c6c6f20776f726c64 15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62ei0`
+
+***Here,*** `15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62ei0` is the delegate transaction ID, ending with i0 to indicate a specific inscription.
+
+- The `delegateTxId` here would point to the inscription or transaction created by the deploy command. This ID links future actions to this delegated allowance.
+
+- Address (`D9UcJkdirVLY11UtF77WnC8peg6xRYsogu`): This is the Dogecoin address where the minted NFT will be associated or sent.
+
+- Content Type (`"text/plain;charset=utf-8"`): Specifies that the data being minted is plain text, encoded in UTF-8 format. This metadata tells the receiving system or application how to interpret the data.
+
+- Hex Data (`48656c6c6f20776f726c64`):
+
+This represents the actual content being minted.
+When decoded, `48656c6c6f20776f726c64` in hex translates to `"Hello world"`.
+
+
+**Mint a delegate inscription from a JPEG file:**
+
+Command:
+
+`node . mint <RECIEVING_DOGE_ADDRESS> <image/jpeg> <path/to/DelegateIMAGE.jpg> <delegateTxId>`
+
+Example:
+
+`node doginals.js mint D9UcJkdirVLY11UtF77WnC8peg6xRYsogu image/jpeg path/to/imageToBeDelegated.jpg 15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62ei0`
+
+***Explanation of Each Part***
+`D9UcJkdirVLY11UtF77WnC8peg6xRYsogu`: The Dogecoin address where the delegated inscription (JPEG file) will be minted.
+
+`image/jpeg`: The content type, specifying that the file is a JPEG image. This tells the system to handle the data as image data in JPEG format.
+
+`path/to/imageToBeDelegated.jpg`: The path to the JPEG file you wish to mint. The doginals.js script will read this file, convert it into hexadecimal format, and inscribe it in the Dogecoin blockchain.
+
+`15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62ei0`: The `delegateTxId`, referring to a previous inscription ID. This indicates that the JPEG is being inscribed under a delegated inscription, allowing minting with the rights specified by this delegate transaction.
+
+**Mint from an inscription:**
+
+Mint a delegate from an already existing inscription by using its inscription ID. This would create a new inscription that references the original one as a delegate, rather than uploading the entire image file again. The command you shared is correct and follows the process of using an existing inscription as a delegate.
+
+Command:
+
+`node . mint D9UcJkdirVLY11UtF77WnC8peg6xRYsogu "" "" <delegate_inscription_ID>`
+
+
+***Explanation of Each Part***
+
+Address (`D9UcJkdirVLY11UtF77WnC8peg6xRYsogu`): This is the Dogecoin address where the new delegate inscription will be associated.
+
+Empty Content Type and Data Fields ("" ""): Leaving these fields empty tells the script that no new data is being inscribed. Instead, it will use the existing inscription referenced by <delegate_inscription_ID>.
+
+Delegate Inscription ID (<delegate_inscription_ID>): This is the ID of the existing inscription you want to use as a delegate. By referencing this ID, you create a new inscription that derives its content or permissions from the original.
+
+***How This Works***
+
+This command essentially reuses the content or data of an existing inscription, which allows you to delegate or "replicate" the original inscription without needing to re-upload the data.
+
+The new inscription will point back to the original, making it useful in cases where you want multiple inscriptions to derive from a single source (e.g., a single image or document).
+
+**Benefits**
+
+Efficiency: This avoids duplicating data on the blockchain, saving space and transaction costs.
+
+Delegate Management: The new inscription acts as a "child" or "derived" delegate of the original, allowing you to create relationships or permissions based on the initial inscription.
+
+
+**Transfer Command:**
+
+`node . delegate transfer <address> <delegate_id> <amount>`
+
+Example:
+
+`node . delegate transfer D9UcJkdirVLY11UtF77WnC8peg6xRYsogu 15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62e 100`
+
+This command transfers `100` units of the delegated rights identified by `15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62e.
+
+These commands provide flexibility in managing delegated inscriptions and rights, allowing for both minting with delegate support and rights management across delegated assets.
+
 
 ### Creating a Child HTML Inscription Referencing the Delegate
 
@@ -452,6 +284,8 @@ Replace `DELEGATE_ADDRESS` with your Dogecoin address and `path/to/delegate.jpg`
 
 Replace `CHILD_ADDRESS` with your Dogecoin address, `path/to/child.html` with the path to your HTML file, `DELEGATE_TXID` with the TXID of the delegate, and `DELEGATE_INDEX` with the index of the output in the delegate transaction.
 
+
+
 ### Running the Server
 
 To run the server and extract inscriptions:
@@ -479,10 +313,50 @@ Access the server at `http://localhost:3000/tx/TXID`, replacing `TXID` with the 
     node doginals.js drc-20 mint    # Mint new DRC-20 tokens
     node doginals.js drc-20 transfer # Transfer DRC-20 tokens
     ```
+***SEE DoginalsREADME.md***
+
+
+
+# Contributing
+
+If you'd like to contribute or donate to our projects, please donate in Dogecoin. For active contributors its as easy as opening issues, and creating pull requests
+
+If You would like to support with Donations, Send all Dogecoin to the following Contributors:
+
+***You can donate to GreatApe here:***
+
+"handle": ***"GreatApe"*** "at": [***"@Greatape42069E"***](https://x.com/Greatape42069E)
+
+ **"Đogecoin_address": "D9pqzxiiUke5eodEzMmxZAxpFcbvwuM4Hg"**
+
+***You can donate to Apezord here:***
+
+"handle": ***"Apezord"*** "at": [***"@apezord"***](https://x.com/apezord)
+
+**"Đogecoin_address": "DNmrp12LfsVwy2Q2B5bvpQ1HU7zCAczYob"**
+
+
+***You can donate to DPAY here:***
+
+"handle": **DPAY** [***"Dogepay_DRC20"***](https://x.com/Dogepay_DRC20) 
+
+**"Đogecoin_address": " "**
+
+
+***You can donate to Big Chief here:***
+
+"handle": **@MartinSeeger2** [***"@MartinSeeger2"***](https://x.com/MartinSeeger2) 
+
+**"Đogecoin_address": "DCHxodkzaKCLjmnG4LP8uH6NKynmntmCNz"**
+
+
+![image](https://github.com/user-attachments/assets/92ad2d4c-b3b1-4464-b9c0-708038634770)
 
 ## License
 
-This project is licensed under the MIT License.
-```
+This project is licensed under the Creative Commons Legal Code
 
-With these updates, you should have a comprehensive script and documentation to create delegate and child inscriptions using Doginals.js.
+CC0 1.0 Universal
+
+
+*With these updates, you should have a Comprehensive script and documentation to Deploy and Create Delegate and child inscriptions using Doginals.js*
