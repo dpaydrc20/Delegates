@@ -340,7 +340,7 @@ If You would like to support with Donations, Send all Dogecoin to the following 
 
 "handle": **DPAY** [***"Dogepay_DRC20"***](https://x.com/Dogepay_DRC20) 
 
-**"Đogecoin_address": " "**
+**"Đogecoin_address": " "*DEXKkt6KVzowBHa2TQkkrh1wZ2EJvhwz2V*
 
 
 ***You can donate to Big Chief here:***
